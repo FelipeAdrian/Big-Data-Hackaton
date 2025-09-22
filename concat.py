@@ -104,13 +104,25 @@ def _build_copy_sql_from_files(files: list[Path], out_path: Path, row_group_size
         (FORMAT PARQUET, COMPRESSION {codec}, ROW_GROUP_SIZE {int(row_group_size)});
     """
 
+def _build_copy_head_sql(in_parquet: Path, out_parquet: Path, limit_rows: int, row_group_size: int, codec: str) -> str:
+    """Escreve apenas as primeiras `limit_rows` linhas do parquet de entrada."""
+    return f"""
+        COPY (
+            SELECT * FROM read_parquet('{_escape_sql_string(in_parquet.as_posix())}')
+            LIMIT {int(limit_rows)}
+        )
+        TO '{_escape_sql_string(out_parquet.as_posix())}'
+        (FORMAT PARQUET, COMPRESSION {codec}, ROW_GROUP_SIZE {int(row_group_size)});
+    """
+
 # =========================
-# Merge incremental c/ limite de tamanho
+# Merge incremental c/ limite de tamanho + HEAD parquet
 # =========================
 def merge_and_round_with_size_cap(
     diretorio_pasta: str,
     output_path: str | None = None,
-    size_cap_mb: int = 23,           # pára quando ultrapassar este tamanho
+    size_cap_mb: int = 15,            # para quando ultrapassar este tamanho
+    head_rows: int = 1_499_900,       # gera parquet extra apenas com esse número de linhas
     row_group_size: int = 32_768,     # menor => menos RAM; pode reduzir p/ 16_384 ou 8_192
     threads: int = 1,                 # 1 thread = menor RAM
     memory_limit: str | int | float = "1GiB",  # ou "2GiB" / "50%" etc.
@@ -131,6 +143,7 @@ def merge_and_round_with_size_cap(
     # destinos
     final_out = Path(output_path).expanduser().resolve() if output_path else (in_dir / "merged_predictions_int.parquet").resolve()
     trial_out = in_dir / "_trial_merged.parquet"  # arquivo temporário para testar tamanho
+    head_out = final_out.with_name(final_out.stem + f"_head{head_rows}.parquet")
 
     # ambiente DuckDB (spill em disco)
     db_path = in_dir / "merge_tmp.duckdb"
@@ -138,7 +151,7 @@ def merge_and_round_with_size_cap(
     tmp_dir.mkdir(exist_ok=True)
 
     # limpar saídas antigas
-    for p in (final_out, trial_out, db_path):
+    for p in (final_out, trial_out, head_out, db_path):
         try:
             p.unlink(missing_ok=True)  # type: ignore
         except Exception:
@@ -156,33 +169,38 @@ def merge_and_round_with_size_cap(
         con.execute("PRAGMA preserve_insertion_order=false;")
         con.execute("PRAGMA enable_object_cache=false;")
 
-        # Tenta BROTLI e cai para GZIP se necessário (somente no passo final e nos trials)
-        def _try_copy(files: list[Path], out_path: Path) -> None:
+        # Tenta BROTLI e cai para GZIP se necessário (retorna codec usado)
+        def _try_copy(files: list[Path], out_path: Path) -> str:
             if prefer_brotli:
                 try:
                     sql = _build_copy_sql_from_files(files, out_path, row_group_size, codec="BROTLI")
                     con.execute(sql)
-                    return
+                    return "BROTLI"
                 except duckdb.Error:
                     pass  # fallback para GZIP
             sql = _build_copy_sql_from_files(files, out_path, row_group_size, codec="GZIP")
             con.execute(sql)
+            return "GZIP"
 
         # Busca o maior prefixo de chunks cujo arquivo resultante não ultrapassa o cap
         last_ok_index = 0
+        last_trial_codec = "GZIP"
         for i in range(1, len(chunks) + 1):
             files_try = chunks[:i]
             # gera trial
             if trial_out.exists():
                 trial_out.unlink()
-            _try_copy(files_try, trial_out)
-
+            codec_used = _try_copy(files_try, trial_out)
             sz = os.path.getsize(trial_out)
-            print(f"[INFO] Trial com {i} chunk(s): {sz/1024/1024:.2f} MB")
+            print(f"[INFO] Trial com {i} chunk(s): {sz/1024/1024:.2f} MB (codec={codec_used})")
             if sz > size_cap_bytes:
                 print(f"[WARN] Limite de {size_cap_mb} MB excedido ao incluir chunk #{i}.")
                 break
             last_ok_index = i
+            last_trial_codec = codec_used
+
+        # escolhe codec do final/HEAD
+        codec_used_final = last_trial_codec
 
         if last_ok_index == 0:
             # até mesmo o primeiro chunk excedeu — mantém o trial como final e avisa
@@ -190,17 +208,36 @@ def merge_and_round_with_size_cap(
             if final_out.exists():
                 final_out.unlink()
             trial_out.rename(final_out)
+            # codec_used_final já é o do trial atual (o que excedeu)
         else:
             # refaz a cópia final (limpa, sem arquivo trial), só com os que cabem
             if final_out.exists():
                 final_out.unlink()
             files_final = chunks[:last_ok_index]
-            _try_copy(files_final, final_out)
+            codec_used_final = _try_copy(files_final, final_out)
             # limpa trial
             try:
                 trial_out.unlink(missing_ok=True)
             except Exception:
                 pass
+
+        print(f"Arquivo final salvo em: {final_out}")
+        try:
+            print(f"Tamanho final: {os.path.getsize(final_out)/1024/1024:.2f} MB")
+        except Exception:
+            pass
+
+        # ---------- GERAR HEAD PARQUET (primeiras N linhas) ----------
+        # usa o mesmo codec do arquivo final
+        if head_out.exists():
+            head_out.unlink()
+        head_sql = _build_copy_head_sql(final_out, head_out, limit_rows=head_rows,
+                                        row_group_size=row_group_size, codec=codec_used_final)
+        con.execute(head_sql)
+        try:
+            print(f"Head parquet salvo em: {head_out}  (tamanho: {os.path.getsize(head_out)/1024/1024:.2f} MB)")
+        except Exception:
+            print(f"Head parquet salvo em: {head_out}")
 
     finally:
         con.close()
@@ -209,23 +246,15 @@ def merge_and_round_with_size_cap(
         except Exception:
             pass
 
-    print(f"Arquivo final salvo em: {final_out}")
-    try:
-        print(f"Tamanho final: {os.path.getsize(final_out)/1024/1024:.2f} MB")
-    except Exception:
-        pass
-
 if __name__ == "__main__":
     # Exemplo de uso:
     dir = '/home/danieldcs/Save/output_forecast/predictions_tmp'
     merge_and_round_with_size_cap(
         diretorio_pasta=dir,
-        size_cap_mb=23,          # limite de 23 MB
-        row_group_size=32_768,   # pode reduzir p/ 16_384 se precisar
+        size_cap_mb=15,            # limite-alvo ~15 MB
+        head_rows=1_499_900,       # salva também um parquet só com as primeiras N linhas
+        row_group_size=32_768,     # pode reduzir p/ 16_384 se precisar
         threads=1,
         memory_limit="1GiB",
-        prefer_brotli=False,     # True = arquivo menor (mais CPU/mem)
+        prefer_brotli=False,       # True = arquivo menor (mais CPU/mem)
     )
-
-
-
