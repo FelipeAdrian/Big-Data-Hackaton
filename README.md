@@ -1,144 +1,278 @@
-# Pipeline de Forecasting de Vendas Escalável
+# Pipeline de Previsões — README
 
-Este projeto implementa um pipeline de ponta a ponta para gerar previsões de vendas semanais em larga escala. A solução foi projetada com foco em performance, eficiência de memória e resiliência, permitindo o processamento de milhões de combinações de loja-produto sem esgotar os recursos do sistema e com a capacidade de retomar o processo em caso de falhas.
+Este repositório contém uma pipeline escalável para gerar previsões semanais por **loja × produto** combinando três abordagens:
 
-# Metodologia do Pipeline
+1. **Zeros** para pares **descontinuados** (sem venda há X semanas);
+2. **LightGBM** nos **pares com maior relevância** (top N por volume);
+3. **Médias rápidas** para o **restante** (com fallback global).
 
-O pipeline é executado em uma sequência de passos lógicos.
+O fluxo produz **arquivos parquet de checkpoint por *chunk* de lojas** e, ao final, um **parquet único**. Há também utilitários para **limpar CSVs** de checkpoints antigos e **mesclar/renomear/arredundar** as previsões finais.
 
-1. Carregamento e Preparação dos Dados
+---
 
-    Os dados de transações, lojas e produtos são lidos a partir de arquivos Parquet.
+## 📦 Estrutura dos scripts
 
-    O script autodetecta os nomes das colunas de ID da loja e do produto a partir de uma lista de candidatos (internal_store_id, pdv, etc.), tornando-o mais flexível.
+### 1) `solver.py` — motor da pipeline (gradiente de qualidade)
 
-    As listas únicas de todas as lojas e produtos são extraídas para formar o "universo" de previsões a serem geradas.
+**O que faz, passo a passo:**
 
-2. Pré-processamento e Agregação
+1. **Lê** os três parquets de entrada:
 
-    Limpeza: Os dados transacionais passam por um pré-processamento que converte datas, trata valores nulos em colunas numéricas (quantity, discount) e otimiza os tipos de dados.
+   * `TRANSACTIONS_PARQUET`: transações com `transaction_date`, `quantity`, `discount`, `internal_store_id`, `internal_product_id`.
+   * `PDVS_PARQUET`: metadados de lojas (usa `pdv` se existir; senão autodetecta).
+   * `PRODUCTS_PARQUET`: metadados de produtos (usa `produto` se existir; senão autodetecta).
+2. **Preprocessa** transações (datas, tipos numéricos, coluna `week_start` alinhada à segunda-feira).
+3. **Agrega semanalmente** por `(loja, produto, week_start)` com features: `quantity`, `trans_count`, `discount_mean`, `discount_max`.
+4. **Pré-calcula** a **média das últimas 4 semanas por produto (global)**: Series para **lookup O(1)**.
+5. **Identifica pares extintos** (semana atual − última semana de venda > `WEEKS_THRESHOLD`) ⇒ **previsão 0** em todos os horizontes.
+6. **Amostra produtos “representativos”** (por `PRODUCT_SAMPLE_RATE`), para tentar usar **média 4 semanas por loja×produto** (se existir histórico recente, senão cai no global).
+7. **(Opcional, se `lightgbm` disponível)**: seleciona **TOP\_LGBM\_PAIRS** (maiores volumes), **constrói painel**, gera **lags/rolagens/agregados**, prepara **targets por horizonte** e **treina 1 modelo por horizonte** com *early stopping*.
 
-    Agregação Semanal: As transações são agregadas por semana, para cada par loja-produto. São calculadas métricas como quantity (soma), trans_count (contagem), e estatísticas de desconto. Esta agregação transforma os dados brutos em uma série temporal semanal, que é a base para as previsões.
+   * Em seguida, **prediz** no **último ponto** de cada par top e **sobrescreve** a predição base (a menos que o par seja extinto).
+8. **Calcula métricas baseline (WMAPE)** por horizonte (média móvel) e salva em `output_forecast/metrics/metrics_by_horizon.csv`.
+9. **Gera previsões por *chunk* de lojas**:
 
+   * Para cada loja no chunk, monta predição **vetorizada** nos 5 horizontes para **todos os produtos**:
 
-3. Definição de Regras de Negócio
+     * **Extintos** → 0;
+     * **Representativos** → média 4 semanas **loja×produto** se existir, **fallback** global por produto;
+     * **Demais** → média 4 semanas **global** por produto;
+     * **Top LGBM** (quando aplicável) → **override** com a saída do modelo.
+   * Escreve **um parquet por chunk** em `output_forecast/predictions_tmp/chunk_XXXXX.parquet`.
+10. **Concatena** todos os chunks parquet em **um arquivo final**:
 
-    Pares Extintos: Um par (loja, produto) é considerado "extinto" se não registrar vendas por um número configurável de semanas (WEEKS_THRESHOLD). As previsões para esses pares são zeradas.
+    * `output_forecast/full_dataset_predictions.parquet`
+    * **Obs.:** a versão atual do `solver.py` também grava `full_dataset_predictions.csv`. Se **não quiser CSV final**, remova a chamada ao `COPY ... TO ... (HEADER, DELIMITER ',')` em `finalize_concatenation`.
 
-    Produtos Representativos: Uma amostra de produtos (PRODUCT_SAMPLE_RATE) é selecionada com base em seu volume total de vendas. Estes produtos são considerados "representativos" e recebem um tratamento diferenciado na lógica de previsão.
+**Saída principal:**
 
-4. Lógica de Previsão
+* `output_forecast/predictions_tmp/chunk_*.parquet` (checkpoints por chunk);
+* `output_forecast/full_dataset_predictions.parquet` (todas as lojas × todos os produtos × 5 horizontes);
+* `output_forecast/metrics/metrics_by_horizon.csv` (baseline de referência).
 
-A previsão para as próximas semanas (definidas em HORIZONS) é gerada com base na seguinte lógica hierárquica para cada par (loja, produto):
+**Campos das previsões:**
 
-    - Verificação de Extinção: Se o par é "extinto", a previsão é 0.
+* `internal_store_id`, `internal_product_id`, `horizon` (1..5), `prediction` (float ≥ 0).
 
-    - Produto Representativo:
+---
 
-        Se há dados de vendas para o par (loja, produto) nas últimas 4 semanas, a previsão é a média de vendas dessa loja e produto.
+### 2) `rm_csvs.py` — limpeza dos CSVs de checkpoint
 
-        Caso contrário (se não houver vendas recentes nessa loja), a previsão utiliza um fallback: a média de vendas global desse produto em todas as lojas nas últimas 4 semanas.
+**O que faz:** apaga **todos os `.csv`** em `output_forecast/predictions_tmp`.
 
-    - Produto Não Representativo:
+**Quando usar:**
 
-        A previsão é sempre a média de vendas global desse produto em todas as lojas nas últimas 4 semanas.
-    Essa abordagem garante que produtos importantes (representativos) tenham previsões mais personalizadas para a realidade de cada loja, enquanto produtos de cauda longa usam uma estimativa mais geral.
+* Se você alterou o `solver.py` para **não gravar CSV por chunk**, ou
+* Se restaram CSVs legados e você quer manter apenas os parquets de checkpoint.
 
-5. Geração e Concatenação dos Resultados
+> ⚠️ Observação importante: no `solver.py` atual, o critério de “pular chunk já processado” checa se **parquet E csv existem**. Se você **não grava CSVs**, ou se rodar `rm_csvs.py` **antes de retomar**, o solver **não vai pular** chunks já processados (ele vai reprocessar e **sobrescrever** o mesmo parquet).
+> Se deseja permitir **resume** apenas com parquet, ajuste no `solver.py` a verificação para olhar **só o parquet**.
 
-    O script itera sobre a lista de lojas em lotes (STORE_CHUNK_SIZE).
+---
 
-    Para cada lote, ele gera todas as previsões e salva o resultado em um arquivo Parquet e CSV temporário no diretório predictions_tmp.
+### 3) `concat.py` — mescla final com arredondamento e renomeação
 
-    Após processar todas as lojas, o DuckDB é usado para concatenar todos os arquivos temporários de forma eficiente, criando os arquivos de saída finais.
+**O que faz:**
 
-# Como Utilizar
+* Lê **todos os parquets** de `output_forecast/predictions_tmp/`;
+* **Arredonda** `prediction` para inteiro (`ROUND → BIGINT`);
+* **Renomeia** campos para layout final:
 
-## Configuração
+  * `internal_store_id → pdv`
+  * `internal_product_id → produto`
+  * `horizon → semana`
+  * `prediction → quantidade` (inteiro)
+* Escreve **um único parquet**:
+  `output_forecast/predictions_tmp/merged_predictions_int.parquet`
 
-Antes de executar, ajuste os parâmetros na seção --------------- PARÂMETROS --------------- do script chunks_do_futuro.py:
+**Quando usar:**
 
-    PDVS_PARQUET: Caminho para o arquivo Parquet com os dados das lojas.
+* Quando você precisa de um **arquivo final “bonito”**, com campo de quantidade **inteira** e nomes “pdv/produto/semana/quantidade”.
+* Normalmente rodado **depois** do `solver.py` (e, se quiser, **depois** do `rm_csvs.py`).
 
-    TRANSACTIONS_PARQUET: Caminho para o arquivo Parquet com os dados de transações.
+---
 
-    PRODUCTS_PARQUET: Caminho para o arquivo Parquet com os dados dos produtos.
+## 🗂️ Estrutura de diretórios esperada
 
-    HORIZONS: Uma lista de horizontes de previsão em semanas (ex: [1, 2, 3, 4, 5]).
+```
+output_forecast/
+├── predictions_tmp/            # checkpoints por chunk (parquet) e arquivos auxiliares
+│   ├── chunk_00000.parquet
+│   ├── chunk_00001.parquet
+│   └── ...
+├── metrics/
+│   └── metrics_by_horizon.csv  # baseline WMAPE por horizonte
+├── full_dataset_predictions.parquet   # concat final (solver)
+└── full_dataset_predictions.csv       # concat final CSV (opcional, solver)
+```
 
-    STORE_CHUNK_SIZE: Número de lojas a serem processadas por lote. Um valor menor consome menos RAM, mas pode ser mais lento.
+> Se você **não quiser CSV algum**, ajuste o `solver.py` para não chamar o `COPY ... TO ... CSV` no final **e** não gravar CSV por chunk.
 
-    PRODUCT_SAMPLE_RATE: Percentual de produtos a serem considerados "representativos" (ex: 0.20 para 20%).
+---
 
-    WEEKS_THRESHOLD: Número de semanas sem vendas para um par ser considerado "extinto".
+## ⚙️ Parâmetros principais (editar em `solver.py`)
 
-    OUTDIR: Diretório principal onde os resultados serão salvos.
+* **Caminhos de entrada**
 
+  * `PDVS_PARQUET`, `TRANSACTIONS_PARQUET`, `PRODUCTS_PARQUET`
 
+* **Qualidade × Desempenho**
 
-## Execução
+  * `TOP_LGBM_PAIRS` (ex.: `50_000`): nº de pares (loja×produto) para LightGBM;
+  * `MAX_LGBM_PANEL_ROWS` (ex.: `4_000_000`): teto de linhas do painel de treino;
+  * `LGBM_MIN_TRAIN_ROWS`: mínimo de linhas por horizonte para treinar o modelo;
+  * `PRODUCT_SAMPLE_RATE` (ex.: `0.20`): % de produtos “representativos” que usam média loja×produto;
+  * `WEEKS_THRESHOLD` (ex.: `12`): sem venda acima desse nº de semanas ⇒ **extinto** (predição 0);
+  * `STORE_CHUNK_SIZE` (ex.: `200`): nº de lojas por chunk (checkpoint); ajuste conforme RAM/IO.
 
-Para iniciar o pipeline, execute o script a partir do seu terminal:
+* **Outros**
 
-    - python chunks_do_futuro.py
+  * `HORIZONS = [1,2,3,4,5]`
+  * `SEED = 42` (reprodutibilidade)
+  * Diretórios: `OUTDIR`, `TMPDIR`, `METRICS_DIR`
 
-O script exibirá o progresso em tempo real, informando cada etapa e mostrando uma barra de progresso para o processamento das lojas.
+---
 
-## Saída
+## 🧪 Pré-requisitos e instalação
 
-Ao final da execução, três arquivos principais serão gerados:
+Python ≥ 3.9. Instale as dependências (LightGBM é opcional — o script funciona sem ele):
 
-    1. output_forecast/full_dataset_predictions.parquet (e .csv)
+```bash
+python -m pip install --upgrade pip
+python -m pip install duckdb pandas numpy pyarrow tqdm
+# opcional (para o bloco LightGBM):
+python -m pip install lightgbm
+```
 
-        Contém a previsão final para cada combinação de loja, produto e horizonte.
+> Se preferir, use também `fastparquet` como engine parquet alternativa.
 
-        Colunas:
+---
 
-            internal_store_id: ID da loja.
+## ▶️ Como rodar
 
-            internal_product_id: ID do produto.
+1. **Rodar a pipeline principal (gera os chunks e o parquet final):**
 
-            horizon: A semana futura da previsão (ex: 1, 2, 3...).
+```bash
+python solver.py
+```
 
-            prediction: A quantidade de vendas previstas.
+2. **(Opcional) Remover CSVs de checkpoints (se houver):**
 
-    2. output_forecast/metrics/metrics_by_horizon.csv
+```bash
+python rm_csvs.py
+```
 
-        Contém as métricas de desempenho do modelo de baseline (média móvel).
+3. **Mesclar e arredondar (saída com nomes finais e quantidade inteira):**
 
-        Colunas:
+```bash
+python concat.py
+```
 
-            horizon: O horizonte de previsão avaliado.
+> Se quiser **pular** a concatenação final do `solver.py` para controlar tudo por fora, comente a chamada `finalize_concatenation` no final do `solver.py` e use só o `concat.py`.
 
-            wmape: O Erro Percentual Absoluto Ponderado (Weighted Mean Absolute Percentage Error) para aquele horizonte.
+---
 
-            n: O número de observações usadas para calcular a métrica.
-            ]
+## 🧠 Lógica de previsão (“gradiente de qualidade”)
 
+* **Extintos** (`weeks_since_sale > WEEKS_THRESHOLD`):
+  → `prediction = 0` para todos os horizontes.
 
-Passo 2: Consolidar os chunks no arquivo final
+* **Top pares (LightGBM)**:
 
-    python concat.py
+  1. Seleciona TOP por `total_sales` (com *cap* por nº de linhas de painel);
+  2. Cria **lags** (`1,2,3,4,8,12,52`), **rolagens** (`qty_4w_sum`, `qty_12w_mean`) e **agregados semanais** (`store_week_total`, `product_global_week`);
+  3. Prepara **targets `target_h{h}`** e treina **1 modelo por horizonte** com *early stopping*;
+  4. **Override** das previsões base usando a **predição do último ponto** de cada par.
 
-Arquivos de Saída
+* **Demais pares**:
 
-Ao final do Passo 2, o arquivo final estará pronto para uso.
+  * **Produtos representativos**: média 4s **loja×produto** (se houver histórico recente), **fallback** média 4s **global por produto**;
+  * **Outros**: média 4s **global por produto**.
 
-Arquivo de Submissão (ex: submission.parquet)
+Tudo é **vetorizado** por loja, evitando varreduras por produto e permitindo ***lookup* O(1)**.
 
-Contém a previsão final, consolidada e formatada.
+---
 
-Colunas:
+## 🧾 Formatos/campos de saída
 
-    -pdv: ID da loja.
-    
-    -produto: ID do produto.
-    
-    -semana: A semana futura da previsão.
-    
-    -quantidade: A quantidade de vendas previstas (valor inteiro).
+### `output_forecast/full_dataset_predictions.parquet` (solver)
 
+* `internal_store_id` (ou `pdv`)
+* `internal_product_id` (ou `produto`)
+* `horizon` (1..5)
+* `prediction` (float)
 
-    Gerado pelo primeiro script, contém as métricas de desempenho do modelo de baseline.
+### `output_forecast/predictions_tmp/merged_predictions_int.parquet` (concat)
+
+* `pdv` (string/id)
+* `produto` (string/id)
+* `semana` (1..5)
+* `quantidade` (inteiro; `ROUND(prediction)`)
+
+---
+
+## 🚦 Checkpoints, retomada e limpeza
+
+* Os **chunks** são salvos em `predictions_tmp/chunk_*.parquet`.
+* **Retomar**: por padrão, o `solver.py` só **pula** um chunk se **parquet e csv** existem.
+
+  * Se não usa CSVs de chunk, **ajuste a checagem** para considerar apenas o parquet ou não rode o `rm_csvs.py` **antes** de retomar.
+* `rm_csvs.py` limpa CSVs de chunk (útil quando você migrou para só-parquet).
+* `concat.py` não depende do parquet final do solver; ele lê **direto** dos parquets de chunk.
+
+---
+
+## 🧰 Dicas de performance
+
+* **IO**: usar disco NVMe ajuda muito na escrita dos parquets de chunk.
+* **Memória**:
+
+  * Diminua `STORE_CHUNK_SIZE` se ver *spikes* de RAM;
+  * Reduza `TOP_LGBM_PAIRS` / `MAX_LGBM_PANEL_ROWS` se o painel LGBM ficar grande.
+* **CPU**: DuckDB paraleliza `COPY (...)`/`read_parquet(...)`.
+* **Barra de progresso**: avança **após cada loja**; se ficar “parado no 0%”, geralmente é a **primeira loja/chunk** levando mais tempo (ex.: cache frio). A versão atual evita filtros N×M e deve evoluir continuamente.
+
+---
+
+## 🧯 Solução de problemas
+
+* **“Travou em 0%”**: confirme que está usando a versão com **médias pré-computadas** (lookup), não varrendo `weekly_df` por produto dentro do loop da loja.
+* **Erro do DuckDB no final**: verifique espaço em disco para o parquet final; como alternativa, use o `concat.py` (que lê parquets por glob) para gerar o arquivo renomeado e com arredondamento.
+* **LightGBM indisponível**: o script segue sem LGBM (apenas médias e zeros). Instale `lightgbm` para habilitar o bloco top-pairs.
+* **Duplicação ao retomar**: se você **não** grava CSVs e a checagem pede `parquet AND csv`, o solver **reprocessa**. Ajuste a checagem para `if chunk_parquet.exists():` somente.
+
+---
+
+## 🔒 Reprodutibilidade
+
+* `SEED=42` em amostragens/modelos;
+* Pré-processamento determinístico;
+* **Loga** contagens de lojas/produtos, nº de pares extintos, produtos representativos e métricas baseline;
+* Versões de libs recomendadas:
+
+  * `duckdb>=1.0.0`, `pandas>=2.2`, `numpy>=1.26`, `pyarrow>=15`, `tqdm>=4.66`, `lightgbm>=4.0` (opcional).
+
+---
+
+## ✅ Checklist rápido
+
+* [ ] Ajustei os **caminhos** dos 3 parquets de entrada?
+* [ ] Defini `TOP_LGBM_PAIRS`, `MAX_LGBM_PANEL_ROWS`, `PRODUCT_SAMPLE_RATE`, `STORE_CHUNK_SIZE`?
+* [ ] Quero **CSV final** do solver? (se não, comente a parte do CSV em `finalize_concatenation`)
+* [ ] Vou **retomar** a execução? (então garanta a checagem correta de existência dos chunks)
+* [ ] Preciso dos nomes finais/inteiros? (rodar `concat.py`)
+
+---
+
+**Pronto!** Agora é só rodar:
+
+```bash
+python solver.py
+python rm_csvs.py          # opcional
+python concat.py
+```
+
+Se quiser, me peça uma versão do `solver.py` já **sem CSVs em nenhum ponto** e com o **resume** baseado apenas em parquet.
+
 
 
