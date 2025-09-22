@@ -113,3 +113,32 @@ Ao final da execução, três arquivos principais serão gerados:
             wmape: O Erro Percentual Absoluto Ponderado (Weighted Mean Absolute Percentage Error) para aquele horizonte.
 
             n: O número de observações usadas para calcular a métrica.
+            ]
+
+
+Passo 2: Consolidar os chunks no arquivo final
+
+    python concat.py
+
+Arquivos de Saída
+
+Ao final do Passo 2, o arquivo final estará pronto para uso.
+
+Arquivo de Submissão (ex: submission.parquet)
+
+Contém a previsão final, consolidada e formatada.
+
+Colunas:
+
+    -pdv: ID da loja.
+    
+    -produto: ID do produto.
+    
+    -semana: A semana futura da previsão.
+    
+    -quantidade: A quantidade de vendas previstas (valor inteiro).
+
+
+    Gerado pelo primeiro script, contém as métricas de desempenho do modelo de baseline.
+
+
